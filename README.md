@@ -599,6 +599,42 @@ Run the test suite:
 pytest -v
 ```
 
+---
+
+# Deploying to Vercel
+
+The root `vercel.json` configures this repository as a Vercel Services deployment:
+
+- `frontend/` is the Next.js service and receives `/` and non-API routes.
+- `backend/` is the FastAPI service and receives `/api/*` without changing the
+  request path.
+
+In the Vercel project settings, select **Services** as the framework. Vercel
+Services are currently in beta. Deploy the repository root so Vercel can read
+the root `vercel.json` and build both services.
+
+The browser calls relative `/api/...` paths in production, so both services use
+the same deployment origin and no production backend URL or service binding is
+needed. During local development, the frontend defaults to `http://localhost:8000`;
+`NEXT_PUBLIC_API_URL` can optionally override that local API base.
+
+Set `GEMINI_API_KEY` as a secret environment variable on the **backend service
+only**. Never create a `NEXT_PUBLIC_GEMINI_API_KEY` variable or put the Gemini
+key in any frontend environment variable. `LLM_MODEL` is optional; the backend
+defaults to `gemini-3.5-flash-lite`. `FRONTEND_ORIGINS` is optional for this
+same-origin deployment; the existing CORS middleware is retained for local
+development and any separately hosted frontend. `SUPABASE_DB_URL` is currently
+unused by the application.
+
+## Deployment state limitation
+
+Interview records and per-interview locks currently live in backend process
+memory. Vercel Functions may restart or handle requests in different instances,
+so an in-progress interview is not guaranteed to be available to a later
+request. Treat this deployment as suitable for evaluation or demos only until
+interview state is moved to a shared persistent store. This deployment setup
+does not change the current state architecture.
+
 The Gemini-dependent workflow is tested using mocked provider responses so that normal development and CI testing do not consume Gemini API credits.
 
 The project also validates:

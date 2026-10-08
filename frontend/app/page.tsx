@@ -3,7 +3,9 @@
 import { ChangeEvent, useEffect, useRef, useState } from "react";
 import VoiceAnswer from "./voice-answer";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? (
+  process.env.NODE_ENV === "development" ? "http://localhost:8000" : ""
+);
 
 type Domain = { name: string };
 type CandidateProfile = { name: string; summary: string; skills: string[] };
