@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useRef, useState } from "react";
 import VoiceAnswer from "./voice-answer";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -52,6 +52,8 @@ export default function Home() {
   const [questionIndex, setQuestionIndex] = useState(0);
   const [result, setResult] = useState<EvaluationResult | null>(null);
   const [unsavedQuestionId, setUnsavedQuestionId] = useState<number | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const submitInFlight = useRef(false);
   const activeQuestion = questions[questionIndex];
 
   useEffect(() => {
@@ -201,10 +203,13 @@ export default function Home() {
   };
 
   const finishInterview = async () => {
-    if (!(await saveCurrentAnswer())) return;
-    if (!window.confirm("Submit all 10 answers for evaluation? You cannot edit them after submission.")) return;
-    setStep("evaluating");
+    if (submitInFlight.current) return;
+    submitInFlight.current = true;
+    setIsSubmitting(true);
     try {
+      if (!(await saveCurrentAnswer())) return;
+      if (!window.confirm("Submit all 10 answers for evaluation? You cannot edit them after submission.")) return;
+      setStep("evaluating");
       const finalResult = await readJson<EvaluationResult>(
         await fetch(`${API_URL}/api/interviews/${interviewId}/complete`, { method: "POST" }),
       );
@@ -213,6 +218,9 @@ export default function Home() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Evaluation could not be completed. Your answers are saved.");
       setStep("interview");
+    } finally {
+      submitInFlight.current = false;
+      setIsSubmitting(false);
     }
   };
 
@@ -344,8 +352,8 @@ export default function Home() {
           {error && <p className="inline-error" role="alert">{error}</p>}
           <div className="interview-footer">
             <button className="back-link" disabled={questionIndex === 0} onClick={() => void moveQuestion(-1)} type="button">← Previous</button>
-            <button className="continue-button" onClick={() => questionIndex === 9 ? void finishInterview() : void moveQuestion(1)} type="button">
-              {questionIndex === 9 ? "Submit interview" : "Save & continue"} <span aria-hidden="true">↗</span>
+            <button className="continue-button" disabled={questionIndex === 9 && isSubmitting} onClick={() => questionIndex === 9 ? void finishInterview() : void moveQuestion(1)} type="button">
+              {questionIndex === 9 && isSubmitting ? "Submitting…" : questionIndex === 9 ? "Submit interview" : "Save & continue"} <span aria-hidden="true">↗</span>
             </button>
           </div>
         </section>}

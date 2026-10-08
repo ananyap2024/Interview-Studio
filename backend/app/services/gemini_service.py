@@ -1,7 +1,7 @@
+import hashlib
 import json
 import logging
 import re
-from threading import Lock
 from typing import TypeVar
 from urllib.parse import quote
 
@@ -46,19 +46,29 @@ def _decode_json(text: str) -> object:
 
 
 class GeminiService:
-    def __init__(self) -> None:
-        self._attempts: dict[tuple[str, str], int] = {}
-        self._attempt_lock = Lock()
+    @staticmethod
+    def _safe_interview_ref(interview_id: str) -> str:
+        return hashlib.sha256(interview_id.encode("utf-8")).hexdigest()[:12]
 
-    def _claim_attempt(self, interview_id: str, stage: str) -> None:
-        key = (interview_id, stage)
-        with self._attempt_lock:
-            attempts = self._attempts.get(key, 0)
-            if attempts >= MAX_ATTEMPTS_PER_STAGE:
-                raise GeminiServiceError("This AI step has used its retry. Please start a new interview.", 409)
-            self._attempts[key] = attempts + 1
+    @staticmethod
+    def _claim_attempt(interview_id: str, stage: str, attempt: int) -> None:
+        if not 1 <= attempt <= MAX_ATTEMPTS_PER_STAGE:
+            logger.warning(
+                "Gemini attempt rejected interview_ref=%s stage=%s attempt=%d category=retry_exhausted",
+                GeminiService._safe_interview_ref(interview_id),
+                CALL_LABELS.get(stage, "unknown_stage"),
+                attempt,
+            )
+            raise GeminiServiceError("This AI step has used its retry. Please start a new interview.", 409)
 
-    async def _request_text(self, stage: str, prompt: str, schema: dict[str, object]) -> str:
+    async def _request_text(
+        self,
+        interview_id: str,
+        stage: str,
+        attempt: int,
+        prompt: str,
+        schema: dict[str, object],
+    ) -> str:
         api_key = settings.gemini_api_key
         if not api_key:
             raise GeminiServiceError("AI service is not configured.", 503)
@@ -73,17 +83,40 @@ class GeminiService:
                 "maxOutputTokens": 3200,
             },
         }
-        logger.info("Gemini call: %s", CALL_LABELS[stage])
+        interview_ref = self._safe_interview_ref(interview_id)
+        logger.info(
+            "Gemini request started interview_ref=%s stage=%s attempt=%d",
+            interview_ref,
+            CALL_LABELS[stage],
+            attempt,
+        )
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 endpoint,
                 headers={"x-goog-api-key": api_key},
                 json=payload,
             )
+        logger.info(
+            "Gemini response received interview_ref=%s stage=%s attempt=%d status=%d",
+            interview_ref,
+            CALL_LABELS[stage],
+            attempt,
+            response.status_code,
+        )
         if response.status_code >= 400:
             raise httpx.HTTPStatusError("Gemini request failed.", request=response.request, response=response)
         data = response.json()
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        if not isinstance(data, dict):
+            raise ValueError("Gemini returned an invalid response envelope.")
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+            raise ValueError("Gemini returned an invalid response envelope.")
+        content = candidates[0].get("content")
+        if not isinstance(content, dict):
+            raise ValueError("Gemini returned an invalid response envelope.")
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            raise ValueError("Gemini returned an invalid response envelope.")
         text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
         if not text:
             raise ValueError("Gemini returned no structured output.")
@@ -101,17 +134,108 @@ class GeminiService:
         if not settings.gemini_api_key:
             raise GeminiServiceError("AI service is not configured.", 503)
         last_error: Exception | None = None
-        for _ in range(MAX_ATTEMPTS_PER_STAGE):
-            self._claim_attempt(interview_id, stage)
+        interview_ref = self._safe_interview_ref(interview_id)
+        for attempt in range(1, MAX_ATTEMPTS_PER_STAGE + 1):
+            self._claim_attempt(interview_id, stage, attempt)
             try:
-                response_text = await self._request_text(stage, prompt, response_model.model_json_schema())
-                return response_model.model_validate(_decode_json(response_text))
+                response_text = await self._request_text(
+                    interview_id,
+                    stage,
+                    attempt,
+                    prompt,
+                    response_model.model_json_schema(),
+                )
             except GeminiServiceError:
                 raise
-            except (httpx.HTTPError, ValueError, ValidationError) as exc:
+            except httpx.TimeoutException as exc:
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=timeout message=request timed out",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                )
                 last_error = exc
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in RETRYABLE_STATUS_CODES:
+                continue
+            except httpx.NetworkError as exc:
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=network message=network request failed",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                )
+                last_error = exc
+                continue
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=provider_http status=%d message=Gemini provider returned HTTP %d",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                    status_code,
+                    status_code,
+                )
+                last_error = exc
+                if status_code not in RETRYABLE_STATUS_CODES:
                     break
+                continue
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=network message=HTTP transport failed",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                )
+                last_error = exc
+                continue
+            except ValueError as exc:
+                category = "provider_response_failure"
+                message = "Gemini returned an unreadable response"
+                if isinstance(exc, json.JSONDecodeError):
+                    category = "provider_response_json_failure"
+                    message = "Gemini returned invalid response JSON"
+                elif str(exc) == "Gemini returned no structured output.":
+                    category = "structured_json_failure"
+                    message = str(exc)
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=%s message=%s",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                    category,
+                    message,
+                )
+                last_error = exc
+                continue
+
+            try:
+                decoded = _decode_json(response_text)
+            except ValueError as exc:
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=structured_json_failure message=%s",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                    str(exc),
+                )
+                last_error = exc
+                continue
+
+            try:
+                return response_model.model_validate(decoded)
+            except ValidationError as exc:
+                error_summary = "; ".join(
+                    f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: {error['type']}"
+                    for error in exc.errors(include_input=False)
+                )[:300]
+                logger.warning(
+                    "Gemini attempt failed interview_ref=%s stage=%s attempt=%d category=pydantic_validation_failure validation_error=%s",
+                    interview_ref,
+                    CALL_LABELS[stage],
+                    attempt,
+                    error_summary,
+                )
+                last_error = exc
         raise GeminiServiceError("The AI response could not be completed. Your interview data has been preserved.") from last_error
 
 
